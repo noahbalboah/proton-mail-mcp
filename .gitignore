@@ -1,0 +1,11 @@
+# Runtime state and secrets: never commit
+data/
+secrets/
+*.env
+!*.env.example
+*.local.md
+
+# Build output and scratch
+server/target/
+work/
+.DS_Store

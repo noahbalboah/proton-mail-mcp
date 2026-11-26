@@ -1,0 +1,10 @@
+%no-protection
+%echo Generating the key that encrypts Bridge's credential store
+Key-Type: RSA
+Key-Length: 3072
+Subkey-Type: RSA
+Subkey-Length: 3072
+Name-Real: pass-key
+Expire-Date: 0
+%commit
+%echo done

@@ -190,6 +190,21 @@ pub fn new_mailbox_name(kind: &str, name: &str) -> Result<String, String> {
     Ok(format!("{prefix}{bare}"))
 }
 
+/// "Folders/A/B" -> ["Folders/A", "Folders/A/B"]. The "Folders/" or "Labels/" root is not a level.
+pub fn ancestors_and_self(name: &str) -> Vec<String> {
+    let Some((root, rest)) = name.split_once('/') else {
+        return vec![name.to_string()];
+    };
+    let mut out = Vec::new();
+    let mut path = root.to_string();
+    for seg in rest.split('/') {
+        path.push('/');
+        path.push_str(seg);
+        out.push(path.clone());
+    }
+    out
+}
+
 fn check_segment_path(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 100 {
         return Err("name must be 1 to 100 characters".into());
@@ -325,8 +340,22 @@ fn run<S: Read + Write>(s: &mut Session<S>, op: &WriteOp, ctx: &DraftContext) ->
             })
         }
         WriteOp::CreateMailbox { name } => {
-            s.create(name)?;
-            Ok(Outcome { text: format!("Created {name}."), detail: Json::Null })
+            // Create each missing level on its own (Folders/A, then Folders/A/B): a one-shot
+            // CREATE of a nested folder whose parent is missing hung Bridge 3.27.2.
+            let existing: Vec<String> = s.list_mailboxes()?.into_iter().map(|m| m.name).collect();
+            let mut created = Vec::new();
+            for level in ancestors_and_self(name) {
+                if !existing.contains(&level) {
+                    s.create(&level)?;
+                    created.push(level);
+                }
+            }
+            let text = if created.is_empty() {
+                format!("{name} already exists; nothing was created.")
+            } else {
+                format!("Created {}.", created.join(", then "))
+            };
+            Ok(Outcome { text, detail: Json::Null })
         }
         WriteOp::SaveDraft(d) => save_draft(s, d, ctx),
     }
@@ -526,6 +555,12 @@ mod tests {
         assert!(label_mailbox("Labels/").is_err());
         assert!(label_mailbox("a*").is_err());
         assert!(label_mailbox("a\"b").is_err());
+    }
+
+    #[test]
+    fn nested_folders_are_created_level_by_level() {
+        assert_eq!(ancestors_and_self("Folders/Amazon/Orders"), vec!["Folders/Amazon", "Folders/Amazon/Orders"]);
+        assert_eq!(ancestors_and_self("Labels/Tax"), vec!["Labels/Tax"]);
     }
 
     #[test]

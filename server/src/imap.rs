@@ -6,6 +6,7 @@
 //! `Labels/` mailbox. `APPEND` is sent only to `Drafts`, and only as a synchronizing literal.
 
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 /// Failure from the IMAP client.
 ///
@@ -45,6 +46,10 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Longest any one command (or the greeting) may take, however the server trickles data. Bridge
+/// sends a progress line every few seconds while a command is stuck, which keeps resetting the
+/// socket read timeout, so this total limit is what ends a hung command.
+pub const COMMAND_DEADLINE: Duration = Duration::from_secs(90);
 const MAX_LINE: usize = 64 * 1024;
 const MAX_LITERAL: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -114,6 +119,8 @@ pub struct Conn<S> {
     /// Next tag number. Tags are `a1`, `a2`, ...
     next_tag: u64,
     mailbox: MailboxState,
+    /// When the command in progress must have finished.
+    deadline: Option<Instant>,
 }
 
 impl<S: Read + Write> Conn<S> {
@@ -125,11 +132,23 @@ impl<S: Read + Write> Conn<S> {
             scan_from: 0,
             next_tag: 1,
             mailbox: MailboxState::None,
+            deadline: None,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), Error> {
+        match self.deadline {
+            Some(d) if Instant::now() >= d => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "command took too long",
+            ))),
+            _ => Ok(()),
         }
     }
 
     /// Server greeting. Only `* OK` is accepted. `PREAUTH` and `BYE` are errors.
     pub fn read_greeting(&mut self) -> Result<(), Error> {
+        self.deadline = Some(Instant::now() + COMMAND_DEADLINE);
         let resp = self.read_response()?;
         if resp.first() == Some(&b'+') || !is_ok_greeting(&resp) {
             return Err(protocol("greeting was not OK"));
@@ -151,6 +170,7 @@ impl<S: Read + Write> Conn<S> {
         cmd: &str,
         literal: Option<&[u8]>,
     ) -> Result<(Vec<Vec<u8>>, Vec<u8>), Error> {
+        self.deadline = Some(Instant::now() + COMMAND_DEADLINE);
         let (tag, op) = self.write_command(cmd, literal)?;
         let result = self.finish_command(&tag, literal);
         let ok = result.is_ok();
@@ -342,6 +362,7 @@ impl<S: Read + Write> Conn<S> {
                 return Err(line_too_long(limit));
             }
             let mut tmp = [0u8; 1024];
+            self.check_deadline()?;
             let n = self.stream.read(&mut tmp)?;
             if n == 0 {
                 return Err(protocol("unexpected end of response"));
@@ -457,6 +478,7 @@ impl<S: Read + Write> Conn<S> {
                 let dest = tmp
                     .get_mut(filled..)
                     .ok_or_else(|| protocol("read bounds"))?;
+                self.check_deadline()?;
                 let n = self.stream.read(dest)?;
                 if n == 0 {
                     return Err(protocol("unexpected end of literal"));
@@ -3323,5 +3345,37 @@ mod tests {
         assert!(wire.contains("a3 UID MOVE "));
         assert!(wire.contains(",50 \"Folders/A/B\"\r\n"));
         assert!(wire.contains("SELECT \"Sent\"\r\n"));
+    }
+
+    /// Sends "* OK progress" forever and never the tagged reply.
+    struct Trickle {
+        sent_greeting: bool,
+    }
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let line: &[u8] = if self.sent_greeting { b"* OK still working\r\n" } else { b"* OK ready\r\n" };
+            self.sent_greeting = true;
+            let n = line.len().min(buf.len());
+            buf[..n].copy_from_slice(&line[..n]);
+            Ok(n)
+        }
+    }
+    impl std::io::Write for Trickle {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trickling_server_hits_the_deadline() {
+        let mut conn = Conn::new(Trickle { sent_greeting: false });
+        conn.read_greeting().unwrap();
+        // Pretend the command started long ago.
+        conn.deadline = Some(Instant::now());
+        let err = conn.finish_command("a1", None).map(|_| ()).unwrap_err();
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == std::io::ErrorKind::TimedOut), "{err:?}");
     }
 }

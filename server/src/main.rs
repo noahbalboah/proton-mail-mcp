@@ -71,7 +71,7 @@ impl Backend for ImapBackend {
         let Some(audit) = &self.audit else {
             return Err("Changes are disabled because the audit log is unavailable.".into());
         };
-        audit.begin(op_id, op.tool(), op.audit_args(), op.budget_cost())?;
+        audit.begin(op_id, op.tool(), op.audit_args())?;
         let date = audit::rfc5322_date(audit::now_unix());
         let domain = self.draft_from.rsplit_once('@').map(|(_, d)| d).unwrap_or("localhost");
         let message_id = format!("<{op_id}@{domain}>");
@@ -122,7 +122,7 @@ fn serve() -> Result<(), String> {
     let (host, port) = imap_target()?;
     let user = setting("IMAP_USER")?;
     let audit_path = setting_or("AUDIT_LOG", "/audit/audit.log");
-    let audit = match AuditLog::open(std::path::Path::new(&audit_path), write::DAILY_BUDGET) {
+    let audit = match AuditLog::open(std::path::Path::new(&audit_path)) {
         Ok(a) => Some(a),
         Err(e) => {
             eprintln!("warning: audit log {audit_path} unavailable ({e}); changes are disabled");

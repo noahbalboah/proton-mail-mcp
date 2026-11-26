@@ -1,27 +1,21 @@
-//! Append-only audit log of every write, one JSON object per line, plus the rolling 24-hour budget
-//! for moves, trash and label removal. Fail closed: if the intent line cannot be written, the
-//! write does not run.
+//! Append-only audit log of every write, one JSON object per line. Fail closed: if the intent line
+//! cannot be written, the write does not run.
 //!
 //! Each write produces two lines with the same `id`: `"phase":"intent"` before anything is sent to
-//! Bridge, then `"phase":"done"` or `"phase":"failed"`. The budget is rebuilt from intent lines on
-//! startup, so a restart does not reset it.
+//! Bridge, then `"phase":"done"` or `"phase":"failed"`.
 
-use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::json::{self, Json};
+use crate::json::Json;
 
 const DAY_SECS: u64 = 86_400;
 
 pub struct AuditLog {
     file: Mutex<File>,
-    /// (unix seconds, cost) of recent budgeted writes.
-    spent: Mutex<VecDeque<(u64, u32)>>,
-    budget: u32,
 }
 
 pub fn now_unix() -> u64 {
@@ -29,58 +23,21 @@ pub fn now_unix() -> u64 {
 }
 
 impl AuditLog {
-    pub fn open(path: &Path, budget: u32) -> std::io::Result<Self> {
-        let mut spent = VecDeque::new();
-        if let Ok(f) = File::open(path) {
-            let cutoff = now_unix().saturating_sub(DAY_SECS);
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                if let Some((ts, cost)) = intent_cost(&line)
-                    && ts > cutoff
-                    && cost > 0
-                {
-                    spent.push_back((ts, cost));
-                }
-            }
-        }
+    pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: Mutex::new(file), spent: Mutex::new(spent), budget })
+        Ok(Self { file: Mutex::new(file) })
     }
 
-    /// Messages still allowed in the current 24-hour window.
-    pub fn remaining(&self, now: u64) -> u32 {
-        let mut spent = self.spent.lock().unwrap_or_else(|p| p.into_inner());
-        while spent.front().is_some_and(|(ts, _)| *ts + DAY_SECS <= now) {
-            spent.pop_front();
-        }
-        self.budget.saturating_sub(spent.iter().map(|(_, c)| *c).sum())
-    }
-
-    /// Charge `cost` against the budget and write the intent line. Errors mean: do not run.
-    pub fn begin(&self, id: &str, tool: &str, args: Json, cost: u32) -> Result<(), String> {
-        let now = now_unix();
-        if cost > 0 {
-            let left = self.remaining(now);
-            if cost > left {
-                return Err(format!(
-                    "Daily limit reached: moves, trash and label removals may touch at most {} messages \
-                     in 24 hours, and {left} remain. Ask the user to do larger clean-ups in Proton Mail.",
-                    self.budget
-                ));
-            }
-        }
+    /// Write the intent line. An error means: do not run the change.
+    pub fn begin(&self, id: &str, tool: &str, args: Json) -> Result<(), String> {
         self.write(Json::obj([
-            ("ts", Json::Number(now.to_string())),
+            ("ts", Json::Number(now_unix().to_string())),
             ("id", Json::str(id)),
             ("phase", Json::str("intent")),
             ("tool", Json::str(tool)),
-            ("cost", Json::Number(cost.to_string())),
             ("args", args),
         ]))
-        .map_err(|_| "The audit log could not be written, so no change was made.".to_string())?;
-        if cost > 0 {
-            self.spent.lock().unwrap_or_else(|p| p.into_inner()).push_back((now, cost));
-        }
-        Ok(())
+        .map_err(|_| "The audit log could not be written, so no change was made.".to_string())
     }
 
     /// Record the result. A failure to write here is reported on stderr only: the change is done.
@@ -113,16 +70,6 @@ impl AuditLog {
         f.write_all(b"\n")?;
         f.flush()
     }
-}
-
-fn intent_cost(line: &str) -> Option<(u64, u32)> {
-    let j = json::parse(line.as_bytes()).ok()?;
-    if j.get("phase").and_then(Json::as_str) != Some("intent") {
-        return None;
-    }
-    let ts = j.get("ts").and_then(Json::as_u64)?;
-    let cost = j.get("cost").and_then(Json::as_u64).and_then(|c| u32::try_from(c).ok())?;
-    Some((ts, cost))
 }
 
 /// RFC 5322 date in UTC, e.g. "Wed, 25 Nov 2026 21:48:03 +0000".
@@ -172,23 +119,21 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_enforced_and_survives_reopen() {
-        let p = temp_path("budget");
+    fn writes_intent_and_result_lines() {
+        let p = temp_path("log");
         {
-            let log = AuditLog::open(&p, 10).unwrap();
-            log.begin("a", "trash_messages", Json::Null, 6).unwrap();
+            let log = AuditLog::open(&p).unwrap();
+            log.begin("a", "trash_messages", Json::Null).unwrap();
             log.finish("a", "trash_messages", Ok(&Json::Null));
-            assert!(log.begin("b", "trash_messages", Json::Null, 5).is_err());
-            log.begin("c", "mark_messages", Json::Null, 0).unwrap();
+            log.begin("b", "move_messages", Json::Null).unwrap();
+            log.finish("b", "move_messages", Err("refused"));
         }
-        let log = AuditLog::open(&p, 10).unwrap();
-        assert_eq!(log.remaining(now_unix()), 4);
-        assert!(log.begin("d", "move_messages", Json::Null, 4).is_ok());
-        assert_eq!(log.remaining(now_unix()), 0);
-        assert_eq!(log.remaining(now_unix() + DAY_SECS + 1), 10);
+        // Reopening appends; it never truncates.
+        AuditLog::open(&p).unwrap().begin("c", "mark_messages", Json::Null).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(text.lines().count(), 4); // the refused call writes nothing
+        assert_eq!(text.lines().count(), 5);
         assert!(text.contains("\"phase\":\"done\""));
+        assert!(text.contains("\"phase\":\"failed\""));
         let _ = std::fs::remove_file(&p);
     }
 }

@@ -30,8 +30,7 @@ So the server, not the agent, must make permanent loss impossible and keep every
 Research notes (2026-11-25): community Proton MCPs lost mail by resolving a label name to any
 mailbox (restrict to `Labels/`). Gluon's CLOSE expunges, so never send CLOSE. MCP tool
 annotations are client hints only, and some clients never ask for confirmation, so every limit
-is enforced on the server. Blast-radius caps: 50 UIDs per call; rolling 24 h budget of 300
-messages for move, trash and remove_label combined, kept in memory and in the audit log.
+is enforced on the server. Batch cap: 50 UIDs per call. (A daily budget was tried and removed at the owner's request.)
 
 ## imap.rs
 

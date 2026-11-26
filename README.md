@@ -73,9 +73,7 @@ are enforced by the server:
   Trash first and skips any already there.
 - **Real folders only.** Move and trash sources must be real folders, never All Mail, Starred or
   a label. A label name always resolves to `Labels/<name>`, never to another mailbox.
-- **Limits on how much can change.** At most 50 messages per call. Moves, trash and label
-  removals share a budget of 300 messages per rolling 24 hours, rebuilt from the audit log after a
-  restart.
+- **Batch size.** At most 50 messages per call.
 - **Audit log.** Every change writes an intent line before anything is sent to Bridge, then a
   done or failed line with Message-IDs, subjects and the old→new UID map, so it can be undone.
   If the log can't be written, the change doesn't run.

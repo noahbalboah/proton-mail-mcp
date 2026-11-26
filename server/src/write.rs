@@ -11,8 +11,6 @@ use crate::{draft, mime};
 
 /// Most messages one write call may touch.
 pub const MAX_UIDS: usize = 50;
-/// Messages that move, trash and remove_label may touch in a rolling 24 hours, combined.
-pub const DAILY_BUDGET: u32 = 300;
 /// Upper bound on the bytes fetched to read one attachment.
 pub const MAX_ATTACHMENT_FETCH: u32 = 25_000_000;
 pub const MAX_DRAFT_BODY: usize = 200_000;
@@ -51,16 +49,6 @@ impl WriteOp {
             WriteOp::Mark { .. } => "mark_messages",
             WriteOp::CreateMailbox { .. } => "create_mailbox",
             WriteOp::SaveDraft(_) => "save_draft",
-        }
-    }
-
-    /// How many messages this call takes out of the daily budget.
-    pub fn budget_cost(&self) -> u32 {
-        match self {
-            WriteOp::Move { uids, .. } | WriteOp::Trash { uids, .. } | WriteOp::RemoveLabel { uids, .. } => {
-                uids.len() as u32
-            }
-            _ => 0,
         }
     }
 
@@ -548,17 +536,6 @@ mod tests {
         assert!(new_mailbox_name("folder", "a//b").is_err());
         assert!(new_mailbox_name("mailbox", "x").is_err());
         assert!(new_mailbox_name("folder", "x%").is_err());
-    }
-
-    #[test]
-    fn budget_counts_only_moves_trash_and_label_removal() {
-        let u = vec![1, 2, 3];
-        assert_eq!(WriteOp::Trash { mailbox: "INBOX".into(), uids: u.clone() }.budget_cost(), 3);
-        assert_eq!(
-            WriteOp::Mark { mailbox: "INBOX".into(), uids: u.clone(), read: Some(true), starred: None }.budget_cost(),
-            0
-        );
-        assert_eq!(WriteOp::RemoveLabel { label: "Labels/x".into(), uids: u }.budget_cost(), 3);
     }
 
     #[test]
